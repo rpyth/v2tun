@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +17,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,7 +27,14 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	_ "github.com/xtls/xray-core/main/distro/all"
+	xraytls "github.com/xtls/xray-core/transport/internet/tls"
 )
+
+const fingerprintOptions = "chrome, firefox, safari, ios, android, edge, 360, qq, random, randomized, randomizednoalpn"
+
+type clientInfo struct {
+	HWID, OS, Model string
+}
 
 type node struct {
 	Name, Address, ID, Encryption, Flow, Network, Security string
@@ -35,12 +46,13 @@ type node struct {
 
 func main() {
 	source := flag.String("c", "", "subscription URL or vless:// URL")
-	port := flag.Int("p", 12334, "local HTTP proxy port")
+	port := flag.Int("p", 0, "local HTTP proxy port (disabled unless specified)")
 	socksPort := flag.Int("s", 12335, "local SOCKS5 proxy port (TCP and UDP)")
+	fingerprint := flag.String("f", "", "VLESS TLS fingerprint override ("+fingerprintOptions+"); default: link fp")
 	exceptions := flag.String("e", "", "file containing direct-connect domains or zones")
 	refresh := flag.Float64("r", 2, "subscription refresh interval in hours")
 	flag.Parse()
-	if *source == "" || *port < 1 || *port > 65535 || *socksPort < 1 || *socksPort > 65535 || *port == *socksPort || *refresh <= 0 {
+	if *source == "" || *port < 0 || *port > 65535 || *socksPort < 1 || *socksPort > 65535 || (*port != 0 && *port == *socksPort) || *refresh <= 0 || !validFingerprint(*fingerprint) {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -50,16 +62,32 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	n, err := loadNode(ctx, *source)
+	var client clientInfo
+	if !strings.HasPrefix(strings.ToLower(*source), "vless://") {
+		client, err = deviceInfo()
+		if err != nil {
+			log.Fatalf("device identity: %v", err)
+		}
+	}
+	n, err := loadNode(ctx, *source, client)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *fingerprint != "" {
+		n.Fingerprint = *fingerprint
+	}
+	if !validFingerprint(n.Fingerprint) {
+		log.Fatalf("unsupported fingerprint %q (choose: %s)", n.Fingerprint, fingerprintOptions)
 	}
 	server, err := start(n, *port, *socksPort, domains)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer func() { server.Close() }()
-	log.Printf("HTTP proxy listening on 127.0.0.1:%d; SOCKS5 proxy (TCP/UDP) on 127.0.0.1:%d; selected %q (%s:%d)", *port, *socksPort, n.Name, n.Address, n.Port)
+	if *port != 0 {
+		log.Printf("HTTP proxy listening on 127.0.0.1:%d", *port)
+	}
+	log.Printf("SOCKS5 proxy (TCP/UDP) on 127.0.0.1:%d; selected %q (%s:%d)", *socksPort, n.Name, n.Address, n.Port)
 	if strings.HasPrefix(strings.ToLower(*source), "vless://") {
 		<-ctx.Done()
 		return
@@ -71,9 +99,16 @@ func main() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			updated, err := loadNode(ctx, *source)
+			updated, err := loadNode(ctx, *source, client)
 			if err != nil {
 				log.Printf("subscription refresh failed; keeping current node: %v", err)
+				continue
+			}
+			if *fingerprint != "" {
+				updated.Fingerprint = *fingerprint
+			}
+			if !validFingerprint(updated.Fingerprint) {
+				log.Printf("subscription refresh has unsupported fingerprint %q; keeping current node", updated.Fingerprint)
 				continue
 			}
 			if sameNode(n, updated) {
@@ -104,7 +139,7 @@ func sameNode(a, b node) bool {
 	return bytes.Equal(x, y)
 }
 
-func loadNode(ctx context.Context, source string) (node, error) {
+func loadNode(ctx context.Context, source string, info clientInfo) (node, error) {
 	if strings.HasPrefix(strings.ToLower(source), "vless://") {
 		return parseNode(source)
 	}
@@ -115,6 +150,14 @@ func loadNode(ctx context.Context, source string) (node, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
 		return node{}, err
+	}
+	if info.HWID != "" {
+		req.Header.Set("User-Agent", "V2Tun/1.0")
+		req.Header.Set("x-hwid", info.HWID)
+		req.Header.Set("x-device-os", info.OS)
+		if info.Model != "" {
+			req.Header.Set("x-device-model", info.Model)
+		}
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -133,6 +176,69 @@ func loadNode(ctx context.Context, source string) (node, error) {
 		return node{}, errors.New("subscription exceeds 8 MiB")
 	}
 	return parseSubscription(data)
+}
+
+func validFingerprint(name string) bool {
+	if name == "" {
+		return true
+	}
+	switch name {
+	case "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "randomizednoalpn":
+		return xraytls.GetFingerprint(name) != nil
+	}
+	return false
+}
+
+func deviceInfo() (clientInfo, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return clientInfo{}, err
+	}
+	path := filepath.Join(dir, "v2tun", "hwid")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return clientInfo{}, err
+		}
+		var id [16]byte
+		if _, err = rand.Read(id[:]); err != nil {
+			return clientInfo{}, err
+		}
+		data = []byte(hex.EncodeToString(id[:]))
+		file, createErr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if os.IsExist(createErr) {
+			data, err = os.ReadFile(path)
+			if err != nil {
+				return clientInfo{}, err
+			}
+		} else if createErr != nil {
+			return clientInfo{}, createErr
+		} else {
+			_, err = file.Write(data)
+			closeErr := file.Close()
+			if err != nil {
+				return clientInfo{}, err
+			}
+			if closeErr != nil {
+				return clientInfo{}, closeErr
+			}
+		}
+	} else if err != nil {
+		return clientInfo{}, err
+	}
+	hwid := strings.TrimSpace(string(data))
+	if len(hwid) != 32 {
+		return clientInfo{}, fmt.Errorf("invalid HWID in %s", path)
+	}
+	if _, err = hex.DecodeString(hwid); err != nil {
+		return clientInfo{}, fmt.Errorf("invalid HWID in %s: %w", path, err)
+	}
+	osName := map[string]string{"windows": "Windows", "darwin": "macOS", "linux": "Linux"}[runtime.GOOS]
+	if osName == "" {
+		osName = runtime.GOOS
+	}
+	hostname, _ := os.Hostname()
+	return clientInfo{HWID: hwid, OS: osName, Model: hostname}, nil
 }
 
 func parseSubscription(data []byte) (node, error) {
@@ -289,12 +395,13 @@ func start(n node, port, socksPort int, exceptions []string) (*core.Instance, er
 	if len(exceptions) > 0 {
 		rules = append(rules, map[string]any{"type": "field", "domain": exceptions, "outboundTag": "direct"})
 	}
+	inbounds := []any{map[string]any{"tag": "socks-in", "listen": "127.0.0.1", "port": socksPort, "protocol": "socks", "settings": map[string]any{"auth": "noauth", "udp": true, "ip": "127.0.0.1"}}}
+	if port != 0 {
+		inbounds = append(inbounds, map[string]any{"tag": "http-in", "listen": "127.0.0.1", "port": port, "protocol": "http", "settings": map[string]any{"allowTransparent": false}})
+	}
 	cfg := map[string]any{
 		"log":       map[string]any{"loglevel": "warning"},
-		"inbounds": []any{
-			map[string]any{"tag": "http-in", "listen": "127.0.0.1", "port": port, "protocol": "http", "settings": map[string]any{"allowTransparent": false}},
-			map[string]any{"tag": "socks-in", "listen": "127.0.0.1", "port": socksPort, "protocol": "socks", "settings": map[string]any{"auth": "noauth", "udp": true, "ip": "127.0.0.1"}},
-		},
+		"inbounds":  inbounds,
 		"outbounds": []any{map[string]any{"tag": "proxy", "protocol": "vless", "settings": settings, "streamSettings": stream}, map[string]any{"tag": "direct", "protocol": "freedom"}},
 		"routing":   map[string]any{"domainStrategy": "AsIs", "rules": rules},
 	}
