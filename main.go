@@ -46,13 +46,14 @@ type node struct {
 
 func main() {
 	source := flag.String("c", "", "subscription URL or vless:// URL")
+	index := flag.Int("i", 0, "VLESS endpoint number (zero-based)")
 	port := flag.Int("p", 0, "local HTTP proxy port (disabled unless specified)")
 	socksPort := flag.Int("s", 12335, "local SOCKS5 proxy port (TCP and UDP)")
 	fingerprint := flag.String("f", "", "VLESS TLS fingerprint override ("+fingerprintOptions+"); default: link fp")
 	exceptions := flag.String("e", "", "file containing direct-connect domains or zones")
 	refresh := flag.Float64("r", 2, "subscription refresh interval in hours")
 	flag.Parse()
-	if *source == "" || *port < 0 || *port > 65535 || *socksPort < 1 || *socksPort > 65535 || (*port != 0 && *port == *socksPort) || *refresh <= 0 || !validFingerprint(*fingerprint) {
+	if *source == "" || *index < 0 || *port < 0 || *port > 65535 || *socksPort < 1 || *socksPort > 65535 || (*port != 0 && *port == *socksPort) || *refresh <= 0 || !validFingerprint(*fingerprint) {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -69,7 +70,7 @@ func main() {
 			log.Fatalf("device identity: %v", err)
 		}
 	}
-	n, err := loadNode(ctx, *source, client)
+	n, err := loadNode(ctx, *source, client, *index)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -99,7 +100,7 @@ func main() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			updated, err := loadNode(ctx, *source, client)
+			updated, err := loadNode(ctx, *source, client, *index)
 			if err != nil {
 				log.Printf("subscription refresh failed; keeping current node: %v", err)
 				continue
@@ -139,8 +140,11 @@ func sameNode(a, b node) bool {
 	return bytes.Equal(x, y)
 }
 
-func loadNode(ctx context.Context, source string, info clientInfo) (node, error) {
+func loadNode(ctx context.Context, source string, info clientInfo, index int) (node, error) {
 	if strings.HasPrefix(strings.ToLower(source), "vless://") {
+		if index != 0 {
+			return node{}, errors.New("a direct VLESS link only has endpoint 0")
+		}
 		return parseNode(source)
 	}
 	u, err := url.Parse(source)
@@ -175,7 +179,22 @@ func loadNode(ctx context.Context, source string, info clientInfo) (node, error)
 	if len(data) > 8<<20 {
 		return node{}, errors.New("subscription exceeds 8 MiB")
 	}
-	return parseSubscription(data)
+	nodes, err := parseSubscription(data)
+	if err != nil {
+		return node{}, err
+	}
+	fmt.Println("Available VLESS endpoints:")
+	for i, n := range nodes {
+		mark := " "
+		if i == index {
+			mark = "x"
+		}
+		fmt.Printf("[%s] %d: %s\n", mark, i, n.Name)
+	}
+	if index < 0 || index >= len(nodes) {
+		return node{}, fmt.Errorf("VLESS endpoint index %d out of range (available: 0-%d)", index, len(nodes)-1)
+	}
+	return nodes[index], nil
 }
 
 func validFingerprint(name string) bool {
@@ -241,7 +260,7 @@ func deviceInfo() (clientInfo, error) {
 	return clientInfo{HWID: hwid, OS: osName, Model: hostname}, nil
 }
 
-func parseSubscription(data []byte) (node, error) {
+func parseSubscription(data []byte) ([]node, error) {
 	s := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
 	if !strings.Contains(strings.ToLower(s), "vless://") {
 		compact := strings.Join(strings.Fields(s), "")
@@ -254,27 +273,32 @@ func parseSubscription(data []byte) (node, error) {
 			}
 		}
 		if err != nil {
-			return node{}, errors.New("subscription is neither VLESS links nor base64-encoded VLESS links")
+			return nil, errors.New("subscription is neither VLESS links nor base64-encoded VLESS links")
 		}
 		s = string(decoded)
 	}
 	var firstErr error
+	var nodes []node
 	for _, line := range strings.Fields(s) {
 		if !strings.HasPrefix(strings.ToLower(line), "vless://") {
 			continue
 		}
 		n, err := parseNode(line)
 		if err == nil {
-			return n, nil
+			nodes = append(nodes, n)
+			continue
 		}
 		if firstErr == nil {
 			firstErr = err
 		}
 	}
-	if firstErr != nil {
-		return node{}, fmt.Errorf("no usable VLESS node: %w", firstErr)
+	if len(nodes) > 0 {
+		return nodes, nil
 	}
-	return node{}, errors.New("subscription contains no VLESS links")
+	if firstErr != nil {
+		return nil, fmt.Errorf("no usable VLESS node: %w", firstErr)
+	}
+	return nil, errors.New("subscription contains no VLESS links")
 }
 
 func parseNode(link string) (node, error) {
@@ -367,9 +391,26 @@ func start(n node, port, socksPort int, exceptions []string) (*core.Instance, er
 		if n.Mode != "" {
 			xhttp["mode"] = n.Mode
 		}
+		extra := make(map[string]json.RawMessage)
 		if len(n.Extra) > 0 {
-			xhttp["extra"] = n.Extra
+			if err := json.Unmarshal(n.Extra, &extra); err != nil || extra == nil {
+				return nil, errors.New("XHTTP extra must be a JSON object")
+			}
 		}
+		// Xray replaces the outer XHTTP settings with extra when it is present,
+		// so the connection policy must live inside extra as well. Do not reuse
+		// an HTTP client across proxied connections: a stale shared client can
+		// otherwise affect later connections until the process is restarted.
+		// These limits retire clients from reuse; they do not cut off streams.
+		extra["xmux"] = json.RawMessage(`{
+			"maxConcurrency": 1,
+			"maxConnections": 0,
+			"cMaxReuseTimes": 1,
+			"hMaxRequestTimes": "600-900",
+			"hMaxReusableSecs": "60-120",
+			"hKeepAlivePeriod": 15
+		}`)
+		xhttp["extra"] = extra
 		stream["xhttpSettings"] = xhttp
 	}
 	if n.Security == "reality" {

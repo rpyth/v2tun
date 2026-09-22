@@ -1,6 +1,8 @@
 # v2tun
 
-`v2tun` exposes local HTTP and SOCKS5 proxies backed by Xray-core's VLESS outbound. The SOCKS5 proxy supports TCP connections and UDP relay. It accepts a single `vless://` link or an HTTP(S) subscription containing newline-separated VLESS links, either plain text or base64 encoded. It selects the first supported link in the subscription. Supported transports are RAW/TCP and XHTTP with TLS or Reality.
+`v2tun` exposes local HTTP and SOCKS5 proxies backed by Xray-core's VLESS outbound. The SOCKS5 proxy supports TCP connections and UDP relay. It accepts a single `vless://` link or an HTTP(S) subscription containing newline-separated VLESS links, either plain text or base64 encoded. It selects endpoint `0` by default; use `-i` to select another supported link in the subscription. Supported transports are RAW/TCP and XHTTP with TLS or Reality.
+
+For the primary XHTTP transport, v2tun overrides the link's `extra.xmux` policy to give each new proxied connection a fresh HTTP client, probe idle connections every 15 seconds, and retire clients from further HTTP request reuse after 60–120 seconds or 600–900 requests. Existing streams are not terminated by these reuse limits. This mitigates stale client reuse at the cost of additional connections and handshakes; it does not impose a timeout on stalled requests inside Xray. Other `extra` fields, including any separate `downloadSettings` transport and its policy, are preserved.
 
 ## Run
 
@@ -19,7 +21,9 @@ The SOCKS5 proxy listens on `127.0.0.1:12335` by default. Set applications that 
 
 `-f` overrides the VLESS link's `fp` setting. Available values are `chrome`, `firefox`, `safari`, `ios`, `android`, `edge`, `360`, `qq`, `random`, `randomized`, and `randomizednoalpn`. `random` selects one of Xray's modern fingerprints once when the program starts. `randomized` uses Xray's randomized TLS fingerprint. If `-f` is omitted, the link's `fp` is used; Reality defaults to `chrome` when neither is set.
 
-`-r` sets the subscription refresh interval in hours (default `2`, e.g. `-r 0.5` for 30 minutes). The current node stays active if fetching or parsing a refresh fails. When the selected node changes, the local listener restarts briefly. A direct `vless://` link is not refreshed.
+`-i` selects a VLESS endpoint by its zero-based number (default `0`), for example `./v2tun -c '<subscription_url>' -i 1` selects the second supported endpoint. Each subscription fetch prints the supported endpoints in subscription order with their numbers and names, marking the selected endpoint with `[x]` and the others with `[ ]`. Invalid or unsupported links are skipped. An out-of-range index reports an error. A direct `vless://` link only accepts `-i 0`.
+
+`-r` sets the subscription refresh interval in hours (default `2`, e.g. `-r 0.5` for 30 minutes). The same endpoint number is selected on each refresh. The current node stays active if fetching or parsing a refresh fails, or if the selected number is no longer available. When the selected node changes, the local listener restarts briefly. A direct `vless://` link is not refreshed.
 
 For subscription URLs, v2tun sends `User-Agent: V2Tun/1.0`, `x-device-os`, `x-device-model` (the host name), and `x-hwid` on each fetch. The HWID is a random, stable installation identifier saved in the user's config directory at `v2tun/hwid`; keeping that file preserves the identity. It is not derived from hardware serial numbers. These headers identify the client to Remnawave when it serves the subscription. Direct `vless://` links make no subscription request, and the VLESS connection itself has no field for Remnawave client name, OS, or HWID.
 
